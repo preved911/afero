@@ -1,23 +1,42 @@
+// Copyright © 2015 Steve Francia <spf@spf13.com>.
+// Copyright 2013 tsuru authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package s3fs
 
 import (
+	"io"
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/spf13/afero"
 )
 
+// S3Fs is a Fs implementation for S3 like storages
 type S3Fs struct {
-	client *s3.S3
+	s3     *s3.S3
+	bucket string
 }
 
-func NewS3Fs(sess *session.Session) afero.Fs {
+func NewS3Fs(sess *session.Session, bucket string) afero.Fs {
 	c := s3.New(sess)
 
 	return &S3Fs{
-		client: c,
+		s3:     c,
+		bucket: bucket,
 	}
 }
 
@@ -34,11 +53,40 @@ func (fs *S3Fs) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (fs *S3Fs) Open(name string) (afero.File, error) {
-	return nil, nil
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	}
+
+	out, err := fs.s3.GetObject(in)
+	if err != nil {
+		return nil, err
+	}
+
+	data := make([]byte, *out.ContentLength)
+	for {
+		_, err := out.Body.Read(data)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			return nil, err
+		}
+	}
+
+	f := &File{
+		fs:   fs,
+		name: name,
+		data: data,
+	}
+
+	return f, nil
 }
 
+// OpenFile same as Open method, because S3 doesn't support access permissions and open flags
 func (fs *S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
-	return nil, nil
+	return fs.Open(name)
 }
 
 func (fs *S3Fs) Remove(name string) error {
