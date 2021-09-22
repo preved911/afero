@@ -15,11 +15,11 @@
 package s3fs
 
 import (
-	"io"
+	// "io"
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
+	// "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/spf13/afero"
@@ -53,32 +53,33 @@ func (fs *S3Fs) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (fs *S3Fs) Open(name string) (afero.File, error) {
-	in := &s3.GetObjectInput{
-		Bucket: aws.String(fs.bucket),
-		Key:    aws.String(name),
-	}
+	// in := &s3.GetObjectInput{
+	// 	Bucket: aws.String(fs.bucket),
+	// 	Key:    aws.String(name),
+	// }
 
-	out, err := fs.s3.GetObject(in)
-	if err != nil {
-		return nil, err
-	}
+	// out, err := fs.s3.GetObject(in)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
-	data := make([]byte, *out.ContentLength)
-	for {
-		_, err := out.Body.Read(data)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+	// data := make([]byte, *out.ContentLength)
+	// for {
+	// 	_, err := out.Body.Read(data)
+	// 	if err != nil {
+	// 		if err == io.EOF {
+	// 			break
+	// 		}
 
-			return nil, err
-		}
-	}
+	// 		return nil, err
+	// 	}
+	// }
 
 	f := &File{
 		fs:   fs,
 		name: name,
-		data: data,
+		// data: data,
+		// out: out,
 	}
 
 	return f, nil

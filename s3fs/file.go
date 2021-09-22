@@ -8,7 +8,7 @@ import (
 	"os"
 	"path"
 	"sync"
-	"sync/atomic"
+	// "sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -26,11 +26,12 @@ var (
 
 type File struct {
 	sync.Mutex
-	fs     *S3Fs
-	name   string
-	closed bool
-	at     int64
-	data   []byte
+	fs   *S3Fs
+	name string
+	// closed bool
+	at int64
+	// data   []byte
+	out *s3.GetObjectOutput
 }
 
 type FileInfo struct {
@@ -43,38 +44,55 @@ func (f *File) Close() error {
 }
 
 func (f *File) Read(b []byte) (n int, err error) {
-	f.Mutex.Lock()
-	defer f.Mutex.Unlock()
+	if f.out == nil {
+		var err error
+		in := &s3.GetObjectInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.name),
+		}
 
-	if f.closed {
-		return 0, ErrFileClosed
+		f.out, err = f.fs.s3.GetObject(in)
+		if err != nil {
+			return 0, err
+		}
 	}
 
-	if len(b) > 0 && int(f.at) == len(f.data) {
-		return 0, io.EOF
-	}
-
-	if int(f.at) > len(f.data) {
-		return 0, io.ErrUnexpectedEOF
-	}
-
-	if len(f.data)-int(f.at) >= len(b) {
-		n = len(b)
-	} else {
-		n = len(f.data) - int(f.at)
-	}
-
-	copy(b, f.data[f.at:f.at+int64(n)])
-	atomic.AddInt64(&f.at, int64(n))
+	n, err = f.out.Body.Read(b)
+	f.at += int64(n)
 
 	return
 }
 
 func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
-	prev := atomic.LoadInt64(&f.at)
-	atomic.StoreInt64(&f.at, off)
+	// skip bytes from begining of File
+	// until ofset will not equal io.Reader internal offset
+	var p []byte
+	for {
+		switch {
+		case off < 0:
+			return 0, io.EOF
+		case f.at+int64(len(b)) < off:
+			p = make([]byte, len(b))
+		case f.at < off && f.at+int64(len(b)) >= off:
+			p = make([]byte, off-f.at)
+		default:
+			p = make([]byte, 0)
+		}
+
+		if len(p) == 0 {
+			break
+		}
+
+		n, err = f.Read(p)
+		f.at += int64(n)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	n, err = f.Read(b)
-	atomic.StoreInt64(&f.at, prev)
+	f.at += int64(n)
+
 	return
 }
 
