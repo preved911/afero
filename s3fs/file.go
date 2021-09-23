@@ -1,17 +1,18 @@
 package s3fs
 
 import (
+	"bytes"
 	"errors"
-	// "fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path"
 	"sync"
-	// "sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	// "github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
@@ -22,15 +23,31 @@ var (
 	ErrFileNotFound      = os.ErrNotExist
 	ErrFileExists        = os.ErrExist
 	ErrDestinationExists = os.ErrExist
+
+	minPartSize = int(5 * 1024 * 1024)
 )
 
 type File struct {
 	sync.Mutex
-	fs   *S3Fs
-	name string
-	// closed bool
-	at int64
-	// data   []byte
+	fs     *S3Fs
+	name   string
+	closed bool
+	fileUpload
+	fileDownload
+}
+
+type fileUpload struct {
+	body      []byte
+	multipart *fileUploadMultipart
+}
+
+type fileUploadMultipart struct {
+	parts []*s3.CompletedPart
+	out   *s3.CreateMultipartUploadOutput
+}
+
+type fileDownload struct {
+	off int64
 	out *s3.GetObjectOutput
 }
 
@@ -40,25 +57,42 @@ type FileInfo struct {
 }
 
 func (f *File) Close() error {
+	if f.closed {
+		return ErrFileClosed
+	}
+
+	err := f.Sync()
+	if err != nil {
+		return err
+	}
+
+	f.fileDownload.out = nil
+	f.fileDownload.off = 0
+
+	f.fileUpload.body = make([]byte, 0)
+	f.fileUpload.multipart = nil
+
+	f.closed = true
+
 	return nil
 }
 
 func (f *File) Read(b []byte) (n int, err error) {
-	if f.out == nil {
-		var err error
+	// we should get file body from remote storage
+	if f.fileDownload.out == nil {
 		in := &s3.GetObjectInput{
 			Bucket: aws.String(f.fs.bucket),
 			Key:    aws.String(f.name),
 		}
 
-		f.out, err = f.fs.s3.GetObject(in)
+		f.fileDownload.out, err = f.fs.s3.GetObject(in)
 		if err != nil {
 			return 0, err
 		}
 	}
 
-	n, err = f.out.Body.Read(b)
-	f.at += int64(n)
+	n, err = f.fileDownload.out.Body.Read(b)
+	f.fileDownload.off += int64(n)
 
 	return
 }
@@ -71,10 +105,10 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 		switch {
 		case off < 0:
 			return 0, io.EOF
-		case f.at+int64(len(b)) < off:
+		case f.fileDownload.off+int64(len(b)) < off:
 			p = make([]byte, len(b))
-		case f.at < off && f.at+int64(len(b)) >= off:
-			p = make([]byte, off-f.at)
+		case f.fileDownload.off < off && f.fileDownload.off+int64(len(b)) >= off:
+			p = make([]byte, off-f.fileDownload.off)
 		default:
 			p = make([]byte, 0)
 		}
@@ -84,14 +118,12 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 		}
 
 		n, err = f.Read(p)
-		f.at += int64(n)
 		if err != nil {
 			return 0, err
 		}
 	}
 
 	n, err = f.Read(b)
-	f.at += int64(n)
 
 	return
 }
@@ -101,11 +133,86 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *File) Write(b []byte) (n int, err error) {
-	return 0, nil
+	if len(b) >= minPartSize || f.fileUpload.multipart != nil {
+		if f.fileUpload.multipart == nil {
+			f.fileUpload.multipart = &fileUploadMultipart{}
+
+			ft := http.DetectContentType(b)
+
+			in := &s3.CreateMultipartUploadInput{
+				Bucket:      aws.String(f.fs.bucket),
+				Key:         aws.String(f.name),
+				ContentType: aws.String(ft),
+			}
+
+			f.fileUpload.multipart.out, err = f.fs.s3.CreateMultipartUpload(in)
+			if err != nil {
+				return 0, err
+			}
+
+			f.fileUpload.multipart.parts = make([]*s3.CompletedPart, 0)
+		}
+
+		partNumber := int64(len(f.fileUpload.multipart.parts) + 1)
+		contentLength := int64(len(b))
+
+		pi := &s3.UploadPartInput{
+			Bucket:        f.fileUpload.multipart.out.Bucket,
+			Key:           f.fileUpload.multipart.out.Key,
+			UploadId:      f.fileUpload.multipart.out.UploadId,
+			Body:          bytes.NewReader(b),
+			PartNumber:    aws.Int64(partNumber),
+			ContentLength: aws.Int64(contentLength),
+		}
+
+		res, err := f.fs.s3.UploadPart(pi)
+		if err != nil {
+			return 0, err
+		} else {
+			f.fileUpload.multipart.parts = append(
+				f.fileUpload.multipart.parts,
+				&s3.CompletedPart{
+					ETag:       res.ETag,
+					PartNumber: aws.Int64(partNumber),
+				},
+			)
+		}
+	} else {
+		f.fileUpload.body = b
+	}
+
+	return int(len(b)), nil
 }
 
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
-	return 0, nil
+	if f.fileDownload.out == nil || f.fileDownload.off < int64(len(b)) {
+		var p []byte
+		for {
+			switch {
+			case off < 0:
+				return 0, io.EOF
+			case int64(len(b))-f.fileDownload.off > int64(minPartSize):
+				p = make([]byte, minPartSize)
+			case int64(len(b))-f.fileDownload.off > 0:
+				p = make([]byte, len(b))
+			default:
+				p = make([]byte, 0)
+			}
+
+			if len(p) == 0 {
+				break
+			}
+
+			n, err = f.Read(p)
+			if err != nil {
+				return 0, err
+			}
+
+			f.fileUpload.body = append(f.fileUpload.body, p...)
+		}
+	}
+
+	return f.Write(f.fileUpload.body)
 }
 
 func (f *File) Name() string { return f.name }
@@ -158,15 +265,69 @@ func (f *File) Stat() (os.FileInfo, error) {
 }
 
 func (f *File) Sync() error {
+	if f.fileUpload.multipart != nil {
+		if f.fileUpload.multipart.out != nil {
+			in := &s3.CompleteMultipartUploadInput{
+				Bucket:   f.fileUpload.multipart.out.Bucket,
+				Key:      f.fileUpload.multipart.out.Key,
+				UploadId: f.fileUpload.multipart.out.UploadId,
+				MultipartUpload: &s3.CompletedMultipartUpload{
+					Parts: f.fileUpload.multipart.parts,
+				},
+			}
+
+			_, err := f.fs.s3.CompleteMultipartUpload(in)
+
+			return err
+		}
+	} else {
+		in := &s3.PutObjectInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.name),
+			Body:   bytes.NewReader(f.fileUpload.body),
+		}
+
+		_, err := f.fs.s3.PutObject(in)
+
+		return err
+	}
+
 	return nil
 }
 
 func (f *File) Truncate(size int64) error {
-	return nil
+	var b []byte
+	for {
+		switch {
+		case size < 0:
+			return io.EOF
+		case size-f.fileDownload.off > int64(minPartSize):
+			b = make([]byte, minPartSize)
+		case size-f.fileDownload.off > 0:
+			b = make([]byte, len(b))
+		default:
+			b = make([]byte, 0)
+		}
+
+		if len(b) == 0 {
+			break
+		}
+
+		_, err := f.Read(b)
+		if err != nil {
+			return err
+		}
+
+		f.fileUpload.body = append(f.fileUpload.body, b...)
+	}
+
+	_, err := f.Write(f.fileUpload.body)
+
+	return err
 }
 
-func (f *File) WriteString(s string) (ret int, err error) {
-	return 0, nil
+func (f *File) WriteString(s string) (n int, err error) {
+	return f.Write([]byte(s))
 }
 
 func (f *FileInfo) Name() string { return *f.name }
