@@ -326,9 +326,7 @@ func (f *File) Truncate(size int64) error {
 	return err
 }
 
-func (f *File) WriteString(s string) (n int, err error) {
-	return f.Write([]byte(s))
-}
+func (f *File) WriteString(s string) (n int, err error) { return f.Write([]byte(s)) }
 
 func (f *FileInfo) Name() string { return *f.name }
 

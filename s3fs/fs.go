@@ -80,9 +80,7 @@ func (fs *S3Fs) Stat(name string) (os.FileInfo, error) {
 	return nil, nil
 }
 
-func (fs *S3Fs) Name() string {
-	return ""
-}
+func (fs *S3Fs) Name() string { return fmt.Sprintf("s3://%s", fs.bucket) }
 
 func (fs *S3Fs) Chmod(name string, mode os.FileMode) error {
 	return nil
