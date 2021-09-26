@@ -59,15 +59,13 @@ func (f *File) Close() error {
 		return ErrFileClosed
 	}
 
-	// err := f.Sync()
-	// if err != nil {
-	// 	return err
-	// }
-
 	f.fileDownload.out = nil
 	f.fileDownload.off = 0
 
 	f.fileUpload.body = make([]byte, 0)
+	if f.fileUpload.multipart != nil {
+		// abort multipart
+	}
 	f.fileUpload.multipart = nil
 
 	f.closed = true
@@ -78,7 +76,7 @@ func (f *File) Close() error {
 func (f *File) Read(b []byte) (n int, err error) {
 	// we should get file body from remote storage
 	if f.fileDownload.out == nil {
-		f.fileDownload.out, err = f.getObject()
+		f.fileDownload.out, err = f.getObjectOutput()
 		if err != nil {
 			return 0, err
 		}
@@ -105,7 +103,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	var err error
 
 	if f.fileDownload.out == nil {
-		f.fileDownload.out, err = f.getObject()
+		f.fileDownload.out, err = f.getObjectOutput()
 		if err != nil {
 			return 0, err
 		}
@@ -128,7 +126,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 				return 0, io.EOF
 			case offset < f.fileDownload.off:
 				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObject()
+				f.fileDownload.out, err = f.getObjectOutput()
 				if err != nil {
 					return 0, err
 				}
@@ -149,7 +147,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 				offset = f.fileDownload.off + offset
 				whence = 0
 				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObject()
+				f.fileDownload.out, err = f.getObjectOutput()
 				if err != nil {
 					return 0, err
 				}
@@ -174,7 +172,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 				offset = size + offset
 				whence = 0
 				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObject()
+				f.fileDownload.out, err = f.getObjectOutput()
 				if err != nil {
 					return 0, err
 				}
@@ -423,7 +421,7 @@ func (f *File) getObjectOutput() (*s3.GetObjectOutput, error) {
 	return f.fs.s3.GetObject(in)
 }
 
-func (f *File) getHeadObjectOutput() (*s3.GetObjectOutput, error) {
+func (f *File) getHeadObjectOutput() (*s3.HeadObjectOutput, error) {
 	in := &s3.HeadObjectInput{
 		Bucket: aws.String(f.fs.bucket),
 		Key:    aws.String(f.name),
