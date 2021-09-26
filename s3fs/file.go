@@ -23,8 +23,6 @@ var (
 	ErrFileNotFound      = os.ErrNotExist
 	ErrFileExists        = os.ErrExist
 	ErrDestinationExists = os.ErrExist
-
-	minPartSize = int(5 * 1024 * 1024)
 )
 
 type File struct {
@@ -61,10 +59,10 @@ func (f *File) Close() error {
 		return ErrFileClosed
 	}
 
-	err := f.Sync()
-	if err != nil {
-		return err
-	}
+	// err := f.Sync()
+	// if err != nil {
+	// 	return err
+	// }
 
 	f.fileDownload.out = nil
 	f.fileDownload.off = 0
@@ -80,12 +78,7 @@ func (f *File) Close() error {
 func (f *File) Read(b []byte) (n int, err error) {
 	// we should get file body from remote storage
 	if f.fileDownload.out == nil {
-		in := &s3.GetObjectInput{
-			Bucket: aws.String(f.fs.bucket),
-			Key:    aws.String(f.name),
-		}
-
-		f.fileDownload.out, err = f.fs.s3.GetObject(in)
+		f.fileDownload.out, err = f.getObject()
 		if err != nil {
 			return 0, err
 		}
@@ -98,42 +91,121 @@ func (f *File) Read(b []byte) (n int, err error) {
 }
 
 func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
-	// skip bytes from begining of File
-	// until ofset will not equal io.Reader internal offset
-	var p []byte
-	for {
-		switch {
-		case off < 0:
-			return 0, io.EOF
-		case f.fileDownload.off+int64(len(b)) < off:
-			p = make([]byte, len(b))
-		case f.fileDownload.off < off && f.fileDownload.off+int64(len(b)) >= off:
-			p = make([]byte, off-f.fileDownload.off)
-		default:
-			p = make([]byte, 0)
-		}
+	// change offset before reading file
+	_, err = f.Seek(off, 0)
+	if err != nil {
+		return
+	}
 
-		if len(p) == 0 {
-			break
-		}
+	return f.Read(b)
+}
 
-		n, err = f.Read(p)
+func (f *File) Seek(offset int64, whence int) (int64, error) {
+	var b []byte
+	var err error
+
+	if f.fileDownload.out == nil {
+		f.fileDownload.out, err = f.getObject()
 		if err != nil {
 			return 0, err
 		}
 	}
 
-	n, err = f.Read(b)
+	stat, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	size := stat.Size()
 
-	return
-}
+	for {
+		switch whence {
+		case 0:
+			// relative to the origin of the file
+			switch {
+			case offset < 0:
+				return 0, io.EOF
+			case offset > size:
+				return 0, io.EOF
+			case offset < f.fileDownload.off:
+				f.fileDownload.off = 0
+				f.fileDownload.out, err = f.getObject()
+				if err != nil {
+					return 0, err
+				}
+			case offset-f.fileDownload.off < f.fs.opts.minPartSize:
+				b = make([]byte, offset-f.fileDownload.off)
+			case offset-f.fileDownload.off >= f.fs.opts.minPartSize:
+				b = make([]byte, f.fs.opts.minPartSize)
+			}
+		case 1:
+			// relative to the current offset
+			switch {
+			case offset < 0 && f.fileDownload.off+offset < 0:
+				return 0, io.EOF
+			case offset+f.fileDownload.off > size:
+				return 0, io.EOF
+			case offset < 0:
+				// we must read from beginning of the file
+				offset = f.fileDownload.off + offset
+				whence = 0
+				f.fileDownload.off = 0
+				f.fileDownload.out, err = f.getObject()
+				if err != nil {
+					return 0, err
+				}
+			case offset < f.fs.opts.minPartSize:
+				b = make([]byte, offset)
+				f.fileDownload.off += offset
+				offset = 0
+			case offset >= f.fs.opts.minPartSize:
+				b = make([]byte, f.fs.opts.minPartSize)
+				f.fileDownload.off += f.fs.opts.minPartSize
+				offset -= f.fs.opts.minPartSize
+			}
+		case 2:
+			// relative to the end
+			switch {
+			case offset >= 0:
+				return 0, io.EOF
+			case -offset >= size:
+				return 0, io.EOF
+			default:
+				// now read from the beggining of the file
+				offset = size + offset
+				whence = 0
+				f.fileDownload.off = 0
+				f.fileDownload.out, err = f.getObject()
+				if err != nil {
+					return 0, err
+				}
+			}
+		}
 
-func (f *File) Seek(offset int64, whence int) (int64, error) {
-	return 0, nil
+		if len(b) == 0 {
+			break
+		}
+
+		_, err := f.Read(b)
+		if err != nil {
+			return 0, err
+		}
+
+		f.fileUpload.body = append(f.fileUpload.body, b...)
+		if int64(len(f.fileUpload.body)) >= f.fs.opts.minPartSize {
+			_, err := f.Write(f.fileUpload.body[:f.fs.opts.minPartSize])
+			if err != nil {
+				return 0, err
+			}
+
+			f.fileUpload.body = f.fileUpload.body[f.fs.opts.minPartSize:]
+		}
+	}
+
+	return f.fileDownload.off, nil
 }
 
 func (f *File) Write(b []byte) (n int, err error) {
-	if len(b) >= minPartSize || f.fileUpload.multipart != nil {
+	if int64(len(b)) >= f.fs.opts.minPartSize || f.fileUpload.multipart != nil {
 		if f.fileUpload.multipart == nil {
 			f.fileUpload.multipart = &fileUploadMultipart{}
 
@@ -185,31 +257,10 @@ func (f *File) Write(b []byte) (n int, err error) {
 }
 
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
-	if f.fileDownload.out == nil || f.fileDownload.off < int64(len(b)) {
-		var p []byte
-		for {
-			switch {
-			case off < 0:
-				return 0, io.EOF
-			case int64(len(b))-f.fileDownload.off > int64(minPartSize):
-				p = make([]byte, minPartSize)
-			case int64(len(b))-f.fileDownload.off > 0:
-				p = make([]byte, len(b))
-			default:
-				p = make([]byte, 0)
-			}
-
-			if len(p) == 0 {
-				break
-			}
-
-			n, err = f.Read(p)
-			if err != nil {
-				return 0, err
-			}
-
-			f.fileUpload.body = append(f.fileUpload.body, p...)
-		}
+	// change offset before writing file
+	_, err = f.Seek(off, 0)
+	if err != nil {
+		return
 	}
 
 	return f.Write(f.fileUpload.body)
@@ -260,8 +311,18 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 	return files, nil
 }
 
-func (f *File) Stat() (os.FileInfo, error) {
-	return nil, nil
+func (f *File) Stat() (fs.FileInfo, error) {
+	out, err := f.getHeadObjectOutput()
+	if err != nil {
+		return nil, err
+	}
+
+	fi := &FileInfo{
+		name: &f.name,
+		size: out.ContentLength,
+	}
+
+	return fi, nil
 }
 
 func (f *File) Sync() error {
@@ -301,8 +362,8 @@ func (f *File) Truncate(size int64) error {
 		switch {
 		case size < 0:
 			return io.EOF
-		case size-f.fileDownload.off > int64(minPartSize):
-			b = make([]byte, minPartSize)
+		case size-f.fileDownload.off > int64(f.fs.opts.minPartSize):
+			b = make([]byte, f.fs.opts.minPartSize)
 		case size-f.fileDownload.off > 0:
 			b = make([]byte, len(b))
 		default:
@@ -351,4 +412,22 @@ func (f *FileInfo) IsDir() bool {
 
 func (f *FileInfo) Sys() interface{} {
 	return nil
+}
+
+func (f *File) getObjectOutput() (*s3.GetObjectOutput, error) {
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(f.fs.bucket),
+		Key:    aws.String(f.name),
+	}
+
+	return f.fs.s3.GetObject(in)
+}
+
+func (f *File) getHeadObjectOutput() (*s3.GetObjectOutput, error) {
+	in := &s3.HeadObjectInput{
+		Bucket: aws.String(f.fs.bucket),
+		Key:    aws.String(f.name),
+	}
+
+	return f.fs.s3.HeadObject(in)
 }

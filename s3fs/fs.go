@@ -15,6 +15,7 @@
 package s3fs
 
 import (
+	"fmt"
 	"os"
 	"time"
 
@@ -27,14 +28,26 @@ import (
 type S3Fs struct {
 	s3     *s3.S3
 	bucket string
+	opts   *S3FsOpts
 }
 
-func NewS3Fs(sess *session.Session, bucket string) afero.Fs {
+type S3FsOpts struct {
+	minPartSize int64
+}
+
+func NewS3Fs(sess *session.Session, bucket string, opts *S3FsOpts) afero.Fs {
+	if opts == nil {
+		opts = &S3FsOpts{
+			minPartSize: int64(5 * 1024 * 1024),
+		}
+	}
+
 	c := s3.New(sess)
 
 	return &S3Fs{
 		s3:     c,
 		bucket: bucket,
+		opts:   opts,
 	}
 }
 
