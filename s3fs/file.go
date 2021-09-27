@@ -36,6 +36,7 @@ type File struct {
 
 type fileUpload struct {
 	body      []byte
+	off       int64
 	multipart *fileUploadMultipart
 }
 
@@ -80,6 +81,11 @@ func (f *File) Read(b []byte) (n int, err error) {
 		if err != nil {
 			return 0, err
 		}
+
+		err := f.shiftBodyFromStart(&f.fileDownload.out.Body, f.fileDownload.off)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	n, err = f.fileDownload.out.Body.Read(b)
@@ -89,167 +95,105 @@ func (f *File) Read(b []byte) (n int, err error) {
 }
 
 func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
-	// change offset before reading file
-	_, err = f.Seek(off, 0)
+	out, err := f.getObjectOutput()
 	if err != nil {
 		return
 	}
 
-	return f.Read(b)
+	err = f.shiftBodyFromStart(&out.Body, off)
+	if err != nil {
+		return
+	}
+
+	return out.Body.Read(b)
 }
 
 func (f *File) Seek(offset int64, whence int) (int64, error) {
-	var b []byte
-	var err error
-
-	if f.fileDownload.out == nil {
-		f.fileDownload.out, err = f.getObjectOutput()
-		if err != nil {
-			return 0, err
-		}
-	}
-
 	stat, err := f.Stat()
 	if err != nil {
 		return 0, err
 	}
 	size := stat.Size()
 
-	for {
-		switch whence {
-		case 0:
-			// relative to the origin of the file
-			switch {
-			case offset < 0:
-				return 0, io.EOF
-			case offset > size:
-				return 0, io.EOF
-			case offset < f.fileDownload.off:
-				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObjectOutput()
-				if err != nil {
-					return 0, err
-				}
-			case offset-f.fileDownload.off < f.fs.opts.minPartSize:
-				b = make([]byte, offset-f.fileDownload.off)
-			case offset-f.fileDownload.off >= f.fs.opts.minPartSize:
-				b = make([]byte, f.fs.opts.minPartSize)
-			}
-		case 1:
-			// relative to the current offset
-			switch {
-			case offset < 0 && f.fileDownload.off+offset < 0:
-				return 0, io.EOF
-			case offset+f.fileDownload.off > size:
-				return 0, io.EOF
-			case offset < 0:
-				// we must read from beginning of the file
-				offset = f.fileDownload.off + offset
-				whence = 0
-				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObjectOutput()
-				if err != nil {
-					return 0, err
-				}
-			case offset < f.fs.opts.minPartSize:
-				b = make([]byte, offset)
-				f.fileDownload.off += offset
-				offset = 0
-			case offset >= f.fs.opts.minPartSize:
-				b = make([]byte, f.fs.opts.minPartSize)
-				f.fileDownload.off += f.fs.opts.minPartSize
-				offset -= f.fs.opts.minPartSize
-			}
-		case 2:
-			// relative to the end
-			switch {
-			case offset >= 0:
-				return 0, io.EOF
-			case -offset >= size:
-				return 0, io.EOF
-			default:
-				// now read from the beggining of the file
-				offset = size + offset
-				whence = 0
-				f.fileDownload.off = 0
-				f.fileDownload.out, err = f.getObjectOutput()
-				if err != nil {
-					return 0, err
-				}
-			}
+	switch whence {
+	case 0:
+		// relative to the origin of the file
+		switch {
+		case offset < 0:
+			return 0, io.EOF
+		case offset > size:
+			return 0, io.EOF
+		default:
+			f.fileDownload.off = offset
 		}
-
-		if len(b) == 0 {
-			break
+	case 1:
+		// relative to the current offset
+		switch {
+		case offset < 0 && f.fileDownload.off+offset < 0:
+			return 0, io.EOF
+		case offset+f.fileDownload.off > size:
+			return 0, io.EOF
+		default:
+			f.fileDownload.off += offset
 		}
-
-		_, err := f.Read(b)
-		if err != nil {
-			return 0, err
-		}
-
-		f.fileUpload.body = append(f.fileUpload.body, b...)
-		if int64(len(f.fileUpload.body)) >= f.fs.opts.minPartSize {
-			_, err := f.Write(f.fileUpload.body[:f.fs.opts.minPartSize])
-			if err != nil {
-				return 0, err
-			}
-
-			f.fileUpload.body = f.fileUpload.body[f.fs.opts.minPartSize:]
+	case 2:
+		// relative to the end
+		switch {
+		case offset >= 0:
+			return 0, io.EOF
+		case -offset >= size:
+			return 0, io.EOF
+		default:
+			f.fileDownload.off = size + offset
 		}
 	}
+
+	f.fileDownload.out = nil
 
 	return f.fileDownload.off, nil
 }
 
 func (f *File) Write(b []byte) (n int, err error) {
-	if int64(len(b)) >= f.fs.opts.minPartSize || f.fileUpload.multipart != nil {
-		if f.fileUpload.multipart == nil {
-			f.fileUpload.multipart = &fileUploadMultipart{}
+	if f.fileUpload.off < f.fileDownload.off {
+		p := make([]byte, f.fs.opts.minPartSize)
+		off := f.fileDownload.off
 
-			ft := http.DetectContentType(b)
+		_, err := f.Seek(0, 0)
+		if err != nil {
+			return 0, err
+		}
 
-			in := &s3.CreateMultipartUploadInput{
-				Bucket:      aws.String(f.fs.bucket),
-				Key:         aws.String(f.name),
-				ContentType: aws.String(ft),
+		for f.fileUpload.off < off {
+			n, err := f.Read(p)
+			if err != nil {
+				if err != io.EOF && n == 0 {
+					return 0, err
+				}
 			}
 
-			f.fileUpload.multipart.out, err = f.fs.s3.CreateMultipartUpload(in)
+			if int64(len(p)) > off {
+				p = p[:off]
+			}
+
+			if int64(n) < f.fs.opts.minPartSize {
+				p = p[:n]
+			}
+
+			err = f.uploadBody(p)
 			if err != nil {
 				return 0, err
 			}
 
-			f.fileUpload.multipart.parts = make([]*s3.CompletedPart, 0)
+			f.fileDownload.off += int64(n)
 		}
-
-		partNumber := int64(len(f.fileUpload.multipart.parts) + 1)
-		contentLength := int64(len(b))
-
-		pi := &s3.UploadPartInput{
-			Bucket:        f.fileUpload.multipart.out.Bucket,
-			Key:           f.fileUpload.multipart.out.Key,
-			UploadId:      f.fileUpload.multipart.out.UploadId,
-			Body:          bytes.NewReader(b),
-			PartNumber:    aws.Int64(partNumber),
-			ContentLength: aws.Int64(contentLength),
-		}
-
-		res, err := f.fs.s3.UploadPart(pi)
-		if err != nil {
-			return 0, err
-		} else {
-			f.fileUpload.multipart.parts = append(
-				f.fileUpload.multipart.parts,
-				&s3.CompletedPart{
-					ETag:       res.ETag,
-					PartNumber: aws.Int64(partNumber),
-				},
-			)
-		}
-	} else {
-		f.fileUpload.body = b
 	}
+
+	err = f.uploadBody(b)
+	if err != nil {
+		return 0, err
+	}
+
+	f.fileDownload.off += int64(len(b))
 
 	return int(len(b)), nil
 }
@@ -261,7 +205,7 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 		return
 	}
 
-	return f.Write(f.fileUpload.body)
+	return f.Write(b)
 }
 
 func (f *File) Name() string { return f.name }
@@ -324,6 +268,36 @@ func (f *File) Stat() (fs.FileInfo, error) {
 }
 
 func (f *File) Sync() error {
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	if f.fileUpload.off < stat.Size() {
+		b := make([]byte, f.fs.opts.minPartSize)
+
+		_, err := f.Seek(f.fileUpload.off, 0)
+		if err != nil {
+			return err
+		}
+
+		for {
+			n, err := f.Read(b)
+			if err != nil {
+				if err == io.EOF {
+					err := f.uploadBody(b[:n])
+					if err != nil {
+						return err
+					}
+
+					break
+				}
+
+				return err
+			}
+		}
+	}
+
 	if f.fileUpload.multipart != nil {
 		if f.fileUpload.multipart.out != nil {
 			in := &s3.CompleteMultipartUploadInput{
@@ -428,4 +402,93 @@ func (f *File) getHeadObjectOutput() (*s3.HeadObjectOutput, error) {
 	}
 
 	return f.fs.s3.HeadObject(in)
+}
+
+func (f *File) shiftBodyFromStart(body *io.ReadCloser, offset int64) error {
+	var b []byte
+	for i := int64(0); i < offset; {
+		switch {
+		case offset <= f.fs.opts.minPartSize:
+			b = make([]byte, offset)
+		case offset-i <= f.fs.opts.minPartSize:
+			b = make([]byte, offset-i)
+		default:
+			b = make([]byte, f.fs.opts.minPartSize)
+		}
+
+		n, err := (*body).Read(b)
+		if err != nil {
+			return err
+		}
+
+		i += int64(n)
+	}
+
+	return nil
+}
+
+func (f *File) uploadBody(b []byte) error {
+	f.fileUpload.body = append(f.fileUpload.body, b...)
+	f.fileUpload.off += int64(len(b))
+
+	for int64(len(f.fileUpload.body)) > f.fs.opts.minPartSize {
+		err := f.uploadPart(f.fileUpload.body[:f.fs.opts.minPartSize])
+		if err != nil {
+			return err
+		}
+
+		f.fileUpload.body = f.fileUpload.body[f.fs.opts.minPartSize:]
+	}
+
+	return nil
+}
+
+func (f *File) uploadPart(b []byte) error {
+	var err error
+
+	if f.fileUpload.multipart == nil {
+		f.fileUpload.multipart = &fileUploadMultipart{}
+
+		ct := http.DetectContentType(b)
+
+		in := &s3.CreateMultipartUploadInput{
+			Bucket:      aws.String(f.fs.bucket),
+			Key:         aws.String(f.name),
+			ContentType: aws.String(ct),
+		}
+
+		f.fileUpload.multipart.out, err = f.fs.s3.CreateMultipartUpload(in)
+		if err != nil {
+			return err
+		}
+
+		f.fileUpload.multipart.parts = make([]*s3.CompletedPart, 0)
+	}
+
+	partNumber := int64(len(f.fileUpload.multipart.parts) + 1)
+	contentLength := int64(len(b))
+
+	pi := &s3.UploadPartInput{
+		Bucket:        f.fileUpload.multipart.out.Bucket,
+		Key:           f.fileUpload.multipart.out.Key,
+		UploadId:      f.fileUpload.multipart.out.UploadId,
+		Body:          bytes.NewReader(b),
+		PartNumber:    aws.Int64(partNumber),
+		ContentLength: aws.Int64(contentLength),
+	}
+
+	res, err := f.fs.s3.UploadPart(pi)
+	if err != nil {
+		return err
+	} else {
+		f.fileUpload.multipart.parts = append(
+			f.fileUpload.multipart.parts,
+			&s3.CompletedPart{
+				ETag:       res.ETag,
+				PartNumber: aws.Int64(partNumber),
+			},
+		)
+	}
+
+	return nil
 }
