@@ -27,9 +27,9 @@ var (
 
 type File struct {
 	sync.Mutex
-	fs     *S3Fs
-	name   string
-	closed bool
+	fs                *S3Fs
+	name              string
+	closed, truncated bool
 	fileUpload
 	fileDownload
 }
@@ -60,14 +60,10 @@ func (f *File) Close() error {
 		return ErrFileClosed
 	}
 
-	f.fileDownload.out = nil
-	f.fileDownload.off = 0
-
-	f.fileUpload.body = make([]byte, 0)
-	if f.fileUpload.multipart != nil {
-		// abort multipart
+	err := f.resetBuffers()
+	if err != nil {
+		return err
 	}
-	f.fileUpload.multipart = nil
 
 	f.closed = true
 
@@ -273,7 +269,7 @@ func (f *File) Sync() error {
 		return err
 	}
 
-	if f.fileUpload.off < stat.Size() {
+	if !f.truncated && f.fileUpload.off < stat.Size() {
 		b := make([]byte, f.fs.opts.minPartSize)
 
 		_, err := f.Seek(f.fileUpload.off, 0)
@@ -300,6 +296,13 @@ func (f *File) Sync() error {
 
 	if f.fileUpload.multipart != nil {
 		if f.fileUpload.multipart.out != nil {
+			if len(f.fileUpload.body) > 0 {
+				err := f.uploadPart(f.fileUpload.body)
+				if err != nil {
+					return err
+				}
+			}
+
 			in := &s3.CompleteMultipartUploadInput{
 				Bucket:   f.fileUpload.multipart.out.Bucket,
 				Key:      f.fileUpload.multipart.out.Key,
@@ -329,34 +332,25 @@ func (f *File) Sync() error {
 }
 
 func (f *File) Truncate(size int64) error {
-	var b []byte
-	for {
-		switch {
-		case size < 0:
-			return io.EOF
-		case size-f.fileDownload.off > int64(f.fs.opts.minPartSize):
-			b = make([]byte, f.fs.opts.minPartSize)
-		case size-f.fileDownload.off > 0:
-			b = make([]byte, len(b))
-		default:
-			b = make([]byte, 0)
-		}
-
-		if len(b) == 0 {
-			break
-		}
-
-		_, err := f.Read(b)
-		if err != nil {
-			return err
-		}
-
-		f.fileUpload.body = append(f.fileUpload.body, b...)
+	err := f.resetBuffers()
+	if err != nil {
+		return err
 	}
 
-	_, err := f.Write(f.fileUpload.body)
+	f.truncated = true
 
-	return err
+	_, err = f.Seek(size, 0)
+	if err != nil {
+		return err
+	}
+
+	b := make([]byte, 0)
+	_, err = f.Write(b)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (f *File) WriteString(s string) (n int, err error) { return f.Write([]byte(s)) }
@@ -489,6 +483,20 @@ func (f *File) uploadPart(b []byte) error {
 			},
 		)
 	}
+
+	return nil
+}
+
+func (f *File) resetBuffers() error {
+	f.fileDownload.out = nil
+	f.fileDownload.off = 0
+
+	f.fileUpload.body = make([]byte, 0)
+	f.fileUpload.off = 0
+	if f.fileUpload.multipart != nil {
+		// abort multipart
+	}
+	f.fileUpload.multipart = nil
 
 	return nil
 }
