@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	// "github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
@@ -51,8 +50,9 @@ type fileDownload struct {
 }
 
 type FileInfo struct {
-	name *string
-	size *int64
+	name  *string
+	size  *int64
+	mtime *time.Time
 }
 
 func (f *File) Close() error {
@@ -219,7 +219,7 @@ func (f *File) Readdir(n int) ([]fs.FileInfo, error) {
 		for _, o := range page.Contents {
 			count++
 
-			fi = append(fi, &FileInfo{o.Key, o.Size})
+			fi = append(fi, &FileInfo{o.Key, o.Size, o.LastModified})
 
 			if count > n && n > 0 {
 				return false
@@ -256,8 +256,9 @@ func (f *File) Stat() (fs.FileInfo, error) {
 	}
 
 	fi := &FileInfo{
-		name: &f.name,
-		size: out.ContentLength,
+		name:  &f.name,
+		size:  out.ContentLength,
+		mtime: out.LastModified,
 	}
 
 	return fi, nil
@@ -359,13 +360,12 @@ func (f *FileInfo) Name() string { return *f.name }
 
 func (f *FileInfo) Size() int64 { return *f.size }
 
+// Mode is not implemented, file modes doesn't supported by s3
 func (f *FileInfo) Mode() fs.FileMode {
 	return 0
 }
 
-func (f *FileInfo) ModTime() time.Time {
-	return time.Now()
-}
+func (f *FileInfo) ModTime() time.Time { return *f.mtime }
 
 func (f *FileInfo) IsDir() bool {
 	_, file := path.Split(*f.name)
@@ -376,6 +376,7 @@ func (f *FileInfo) IsDir() bool {
 	return true
 }
 
+// Sys is not implemented yet
 func (f *FileInfo) Sys() interface{} {
 	return nil
 }

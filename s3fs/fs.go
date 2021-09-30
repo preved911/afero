@@ -64,17 +64,16 @@ func (fs *S3Fs) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (fs *S3Fs) Open(name string) (afero.File, error) {
+	return OpenFile(name, os.O_RDONLY, 0)
+}
+
+func (fs *S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	f := &File{
 		fs:   fs,
 		name: name,
 	}
 
 	return f, nil
-}
-
-// OpenFile same as Open method, because S3 doesn't support access permissions and open flags
-func (fs *S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
-	return fs.Open(name)
 }
 
 func (fs *S3Fs) Remove(name string) error {
