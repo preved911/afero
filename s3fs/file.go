@@ -12,22 +12,22 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 var (
-	ErrFileClosed        = errors.New("File is closed")
-	ErrOutOfRange        = errors.New("Out of range")
-	ErrTooLarge          = errors.New("Too large")
-	ErrFileNotFound      = os.ErrNotExist
-	ErrFileExists        = os.ErrExist
-	ErrDestinationExists = os.ErrExist
+	ErrExist    = os.ErrExist
+	ErrNotExist = os.ErrNotExist
+	ErrClosed   = os.ErrClosed
+	ErrReadOnly = errors.New("read-only file")
 )
 
 type File struct {
 	sync.Mutex
 	fs                *S3Fs
 	name              string
+	flag              int
 	closed, truncated bool
 	fileUpload
 	fileDownload
@@ -135,9 +135,9 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	case 2:
 		// relative to the end
 		switch {
-		case offset >= 0:
+		case offset > 0:
 			return 0, io.EOF
-		case -offset >= size:
+		case -offset > size:
 			return 0, io.EOF
 		default:
 			f.fileDownload.off = size + offset
@@ -150,11 +150,15 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *File) Write(b []byte) (n int, err error) {
+	if f.flag & O_RDONLY {
+		return 0, ErrReadOnly
+	}
+
 	if f.fileUpload.off < f.fileDownload.off {
 		p := make([]byte, f.fs.opts.minPartSize)
 		off := f.fileDownload.off
 
-		_, err := f.Seek(0, 0)
+		_, err := f.Seek(f.fileUpload.off, 0)
 		if err != nil {
 			return 0, err
 		}
@@ -167,20 +171,14 @@ func (f *File) Write(b []byte) (n int, err error) {
 				}
 			}
 
-			if int64(len(p)) > off {
-				p = p[:off]
-			}
-
-			if int64(n) < f.fs.opts.minPartSize {
-				p = p[:n]
+			if int64(len(p)) > off-f.fileUpload.off {
+				p = p[:off-f.fileUpload.off]
 			}
 
 			err = f.uploadBody(p)
 			if err != nil {
 				return 0, err
 			}
-
-			f.fileDownload.off += int64(n)
 		}
 	}
 
@@ -189,12 +187,16 @@ func (f *File) Write(b []byte) (n int, err error) {
 		return 0, err
 	}
 
-	f.fileDownload.off += int64(len(b))
+	f.fileDownload.off = f.fileUpload.off
 
 	return int(len(b)), nil
 }
 
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
+	if f.flag & O_RDONLY {
+		return 0, ErrReadOnly
+	}
+
 	// change offset before writing file
 	_, err = f.Seek(off, 0)
 	if err != nil {
@@ -252,6 +254,12 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 func (f *File) Stat() (fs.FileInfo, error) {
 	out, err := f.getHeadObjectOutput()
 	if err != nil {
+		if awsErr, ok := err.(awserr.RequestFailure); ok {
+			if awsErr.StatusCode() == 404 {
+				return nil, ErrFileNotFound
+			}
+		}
+
 		return nil, err
 	}
 
@@ -267,30 +275,39 @@ func (f *File) Stat() (fs.FileInfo, error) {
 func (f *File) Sync() error {
 	stat, err := f.Stat()
 	if err != nil {
-		return err
-	}
-
-	if !f.truncated && f.fileUpload.off < stat.Size() {
-		b := make([]byte, f.fs.opts.minPartSize)
-
-		_, err := f.Seek(f.fileUpload.off, 0)
-		if err != nil {
+		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
+	}
 
-		for {
-			n, err := f.Read(b)
+	if stat != nil {
+		if !f.truncated && f.fileUpload.off < stat.Size() {
+			b := make([]byte, f.fs.opts.minPartSize)
+
+			_, err := f.Seek(f.fileUpload.off, 0)
 			if err != nil {
-				if err == io.EOF {
-					err := f.uploadBody(b[:n])
-					if err != nil {
-						return err
+				return err
+			}
+
+			for {
+				n, err := f.Read(b)
+				if err != nil {
+					if err == io.EOF {
+						err := f.uploadBody(b[:n])
+						if err != nil {
+							return err
+						}
+
+						break
 					}
 
-					break
+					return err
 				}
 
-				return err
+				err = f.uploadBody(b[:n])
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}

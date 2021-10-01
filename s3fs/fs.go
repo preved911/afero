@@ -64,13 +64,14 @@ func (fs *S3Fs) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (fs *S3Fs) Open(name string) (afero.File, error) {
-	return OpenFile(name, os.O_RDONLY, 0)
+	return fs.OpenFile(name, os.O_RDONLY, 0)
 }
 
 func (fs *S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	f := &File{
 		fs:   fs,
 		name: name,
+		flag: flag,
 	}
 
 	return f, nil
