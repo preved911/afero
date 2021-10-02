@@ -17,8 +17,10 @@ package s3fs
 import (
 	"fmt"
 	"os"
+	"path"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/spf13/afero"
@@ -74,10 +76,39 @@ func (fs *S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		flag: flag,
 	}
 
+	if flag&os.O_TRUNC != 0 {
+		err := f.Truncate(0)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if flag&os.O_CREATE == 0 {
+		_, err := f.Stat()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return f, nil
 }
 
 func (fs *S3Fs) Remove(name string) error {
+	_, err := fs.Open(name)
+	if err != nil {
+		return err
+	}
+
+	in := &s3.DeleteObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	}
+
+	_, err = fs.s3.DeleteObject(in)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -86,6 +117,27 @@ func (fs *S3Fs) RemoveAll(name string) error {
 }
 
 func (fs *S3Fs) Rename(oldname, newname string) error {
+	c := &s3.CopyObjectInput{
+		Bucket:     aws.String(fs.bucket),
+		Key:        aws.String(newname),
+		CopySource: aws.String(path.Join(fs.bucket, oldname)),
+	}
+
+	_, err := fs.s3.CopyObject(c)
+	if err != nil {
+		return err
+	}
+
+	d := &s3.DeleteObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(oldname),
+	}
+
+	_, err = fs.s3.DeleteObject(d)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 

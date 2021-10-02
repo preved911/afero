@@ -17,10 +17,12 @@ import (
 )
 
 var (
-	ErrExist    = os.ErrExist
-	ErrNotExist = os.ErrNotExist
-	ErrClosed   = os.ErrClosed
-	ErrReadOnly = errors.New("read-only file")
+	ErrExist      = os.ErrExist
+	ErrNotExist   = os.ErrNotExist
+	ErrClosed     = os.ErrClosed
+	ErrReadOnly   = errors.New("read-only file")
+	ErrWriteOnly  = errors.New("write-only file")
+	ErrAppendOnly = errors.New("append-only file")
 )
 
 type File struct {
@@ -57,7 +59,7 @@ type FileInfo struct {
 
 func (f *File) Close() error {
 	if f.closed {
-		return ErrFileClosed
+		return ErrClosed
 	}
 
 	err := f.resetBuffers()
@@ -71,6 +73,10 @@ func (f *File) Close() error {
 }
 
 func (f *File) Read(b []byte) (n int, err error) {
+	if f.flag&os.O_WRONLY != 0 {
+		return 0, ErrWriteOnly
+	}
+
 	// we should get file body from remote storage
 	if f.fileDownload.out == nil {
 		f.fileDownload.out, err = f.getObjectOutput()
@@ -91,6 +97,10 @@ func (f *File) Read(b []byte) (n int, err error) {
 }
 
 func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
+	if f.flag&os.O_WRONLY != 0 {
+		return 0, ErrWriteOnly
+	}
+
 	out, err := f.getObjectOutput()
 	if err != nil {
 		return
@@ -150,8 +160,28 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *File) Write(b []byte) (n int, err error) {
-	if f.flag & O_RDONLY {
+	if f.flag == 0 {
 		return 0, ErrReadOnly
+	}
+
+	if f.flag&os.O_APPEND != 0 {
+		stat, err := f.Stat()
+		if err != nil {
+			if errors.Is(err, ErrNotExist) {
+				if f.flag&os.O_CREATE == 0 {
+					return 0, err
+				}
+			} else {
+				return 0, err
+			}
+		}
+
+		if stat != nil {
+			_, err = f.Seek(stat.Size(), 0)
+			if err != nil {
+				return 0, err
+			}
+		}
 	}
 
 	if f.fileUpload.off < f.fileDownload.off {
@@ -193,7 +223,7 @@ func (f *File) Write(b []byte) (n int, err error) {
 }
 
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
-	if f.flag & O_RDONLY {
+	if f.flag == 0 {
 		return 0, ErrReadOnly
 	}
 
@@ -256,7 +286,7 @@ func (f *File) Stat() (fs.FileInfo, error) {
 	if err != nil {
 		if awsErr, ok := err.(awserr.RequestFailure); ok {
 			if awsErr.StatusCode() == 404 {
-				return nil, ErrFileNotFound
+				return nil, ErrNotExist
 			}
 		}
 
@@ -273,9 +303,20 @@ func (f *File) Stat() (fs.FileInfo, error) {
 }
 
 func (f *File) Sync() error {
+	if f.flag == 0 {
+		return ErrReadOnly
+	}
+
 	stat, err := f.Stat()
 	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
+		// if errors.Is(err, ErrNotExist) {
+		// 	if f.flag&os.O_CREATE == 0 {
+		// 		return err
+		// 	}
+		// } else {
+		// 	return err
+		// }
+		if !errors.Is(err, ErrNotExist) {
 			return err
 		}
 	}
@@ -350,6 +391,14 @@ func (f *File) Sync() error {
 }
 
 func (f *File) Truncate(size int64) error {
+	if f.flag == 0 {
+		return ErrReadOnly
+	}
+
+	if f.flag&os.O_APPEND != 0 {
+		return ErrAppendOnly
+	}
+
 	err := f.resetBuffers()
 	if err != nil {
 		return err
@@ -358,12 +407,6 @@ func (f *File) Truncate(size int64) error {
 	f.truncated = true
 
 	_, err = f.Seek(size, 0)
-	if err != nil {
-		return err
-	}
-
-	b := make([]byte, 0)
-	_, err = f.Write(b)
 	if err != nil {
 		return err
 	}
